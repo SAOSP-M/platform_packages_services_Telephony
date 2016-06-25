@@ -26,16 +26,19 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.telecom.PhoneAccount;
+import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 
 import com.android.internal.telephony.Call;
+import com.android.internal.telephony.CallStateException;
 import com.android.internal.telephony.Connection;
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.PhoneProxy;
 import com.android.internal.telephony.TelephonyIntents;
+import com.android.internal.telephony.cdma.CDMAPhone;
 import com.android.internal.telephony.cdma.CdmaCallWaitingNotification;
 import com.android.phone.PhoneUtils;
 
@@ -202,6 +205,15 @@ final class PstnIncomingCallNotifier {
         }
         Connection connection = (Connection) asyncResult.result;
         if (connection != null) {
+            // Because there is a handler between telephony and here, it causes this action to be
+            // asynchronous which means that the call can switch to DISCONNECTED by the time it gets
+            // to this code. Check here to ensure we are not adding a disconnected or IDLE call.
+            Call.State state = connection.getState();
+            if (state == Call.State.DISCONNECTED || state == Call.State.IDLE) {
+                Log.i(this, "Skipping new unknown connection because it is idle. " + connection);
+                return;
+            }
+
             Call call = connection.getCall();
             if (call != null && call.getState().isAlive()) {
                 addNewUnknownCall(connection);
@@ -211,6 +223,7 @@ final class PstnIncomingCallNotifier {
 
     private void addNewUnknownCall(Connection connection) {
         Log.i(this, "addNewUnknownCall, connection is: %s", connection);
+
         if (!maybeSwapAnyWithUnknownConnection(connection)) {
             Log.i(this, "determined new connection is: %s", connection);
             Bundle extras = null;
@@ -220,8 +233,16 @@ final class PstnIncomingCallNotifier {
                 Uri uri = Uri.fromParts(PhoneAccount.SCHEME_TEL, connection.getAddress(), null);
                 extras.putParcelable(TelecomManager.EXTRA_UNKNOWN_CALL_HANDLE, uri);
             }
-            TelecomManager.from(mPhoneProxy.getContext()).addNewUnknownCall(
-                    PhoneUtils.makePstnPhoneAccountHandle(mPhoneProxy), extras);
+            PhoneAccountHandle handle = findCorrectPhoneAccountHandle();
+            if (handle == null) {
+                try {
+                    connection.hangup();
+                } catch (CallStateException e) {
+                    // connection already disconnected. Do nothing
+                }
+            } else {
+                TelecomManager.from(mPhoneProxy.getContext()).addNewUnknownCall(handle, extras);
+            }
         } else {
             Log.i(this, "swapped an old connection, new one is: %s", connection);
         }
@@ -238,8 +259,44 @@ final class PstnIncomingCallNotifier {
             Uri uri = Uri.fromParts(PhoneAccount.SCHEME_TEL, connection.getAddress(), null);
             extras.putParcelable(TelecomManager.EXTRA_INCOMING_CALL_ADDRESS, uri);
         }
-        TelecomManager.from(mPhoneProxy.getContext()).addNewIncomingCall(
-                PhoneUtils.makePstnPhoneAccountHandle(mPhoneProxy), extras);
+        PhoneAccountHandle handle = findCorrectPhoneAccountHandle();
+        if (handle == null) {
+            try {
+                connection.hangup();
+            } catch (CallStateException e) {
+                // connection already disconnected. Do nothing
+            }
+        } else {
+            TelecomManager.from(mPhoneProxy.getContext()).addNewIncomingCall(handle, extras);
+        }
+    }
+
+    /**
+     * Returns the PhoneAccount associated with this {@code PstnIncomingCallNotifier}'s phone. On a
+     * device with No SIM or in airplane mode, it can return an Emergency-only PhoneAccount. If no
+     * PhoneAccount is registered with telecom, return null.
+     * @return A valid PhoneAccountHandle that is registered to Telecom or null if there is none
+     * registered.
+     */
+    private PhoneAccountHandle findCorrectPhoneAccountHandle() {
+        TelecomAccountRegistry telecomAccountRegistry = TelecomAccountRegistry.getInstance(null);
+        // Check to see if a the SIM PhoneAccountHandle Exists for the Call.
+        PhoneAccountHandle handle = PhoneUtils.makePstnPhoneAccountHandle(mPhoneBase);
+        if (telecomAccountRegistry.hasAccountEntryForPhoneAccount(handle)) {
+            return handle;
+        }
+        // The PhoneAccountHandle does not match any PhoneAccount registered in Telecom.
+        // This is only known to happen if there is no SIM card in the device and the device
+        // receives an MT call while in ECM. Use the Emergency PhoneAccount to receive the account.
+        PhoneAccountHandle emergencyHandle =
+                PhoneUtils.makePstnPhoneAccountHandleWithPrefix(mPhoneBase, "",
+                        true /* isEmergency */);
+        if(telecomAccountRegistry.hasAccountEntryForPhoneAccount(emergencyHandle)) {
+            Log.i(this, "Receiving MT call in ECM. Using Emergency PhoneAccount Instead.");
+            return emergencyHandle;
+        }
+        Log.w(this, "PhoneAccount not found.");
+        return null;
     }
 
     /**
@@ -259,10 +316,12 @@ final class PstnIncomingCallNotifier {
                 if (service != null) {
                     for (android.telecom.Connection telephonyConnection : service
                             .getAllConnections()) {
-                        if (maybeSwapWithUnknownConnection(
-                                (TelephonyConnection) telephonyConnection,
-                                unknown)) {
-                            return true;
+                        if (telephonyConnection instanceof TelephonyConnection) {
+                            if (maybeSwapWithUnknownConnection(
+                                    (TelephonyConnection) telephonyConnection,
+                                    unknown)) {
+                                return true;
+                            }
                         }
                     }
                 }

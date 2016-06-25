@@ -204,7 +204,7 @@ public class NetworkSetting extends PreferenceActivity
             Message msg = mHandler.obtainMessage(EVENT_NETWORK_SELECTION_DONE);
             Phone phone = PhoneFactory.getPhone(mPhoneId);
             if (phone != null) {
-                phone.selectNetworkManually(mNetworkMap.get(selectedCarrier), msg);
+                phone.selectNetworkManually(mNetworkMap.get(selectedCarrier), true, msg);
                 displayNetworkSeletionInProgress(networkStr);
                 handled = true;
             } else {
@@ -270,8 +270,9 @@ public class NetworkSetting extends PreferenceActivity
         // we want this service to just stay in the background until it is killed, we
         // don't bother stopping it from our end.
         startService (new Intent(this, NetworkQueryService.class));
-        bindService (new Intent(this, NetworkQueryService.class), mNetworkQueryServiceConnection,
-                Context.BIND_AUTO_CREATE);
+        bindService (new Intent(this, NetworkQueryService.class).setAction(
+                NetworkQueryService.ACTION_LOCAL_BINDER),
+                mNetworkQueryServiceConnection, Context.BIND_AUTO_CREATE);
     }
 
     @Override
